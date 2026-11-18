@@ -65,7 +65,7 @@ bash xray-kit.sh chain 'XKIT1:……'
 | `bash xray-kit.sh show` | 再看一次汇总和文件位置 |
 | `bash xray-kit.sh unchain` | 拆掉链式，全部恢复从第一台出 |
 
-参数：`--name` 节点名，`--sni` 指定 Reality 伪装站（默认自动挑一个支持 TLS1.3 + H2 的），`--port` 指定端口（install 时是 Reality 端口，exit 时是出口端口，默认随机 40000-60000）。
+参数：`--name` 节点名，`--sni` 指定 Reality 伪装站（默认自动挑一个支持 TLS1.3 + H2 的），`--port` 指定端口（install 时是 Reality 端口，exit 时是出口端口，默认随机 40000-60000），`--no-lockdown`（exit 用）不关闭出口机上的其他端口。
 
 脚本可以反复运行，已有的密码和密钥保持不变，发出去的配置一直有效。
 
@@ -76,7 +76,7 @@ bash xray-kit.sh chain 'XKIT1:……'
 - 从节点直接出：YouTube、Twitch、Vimeo、Spotify、SoundCloud、Steam / Epic / 主机平台下载、Apple 和 Windows 更新、Google 下载、Google Drive、Colab、GitHub、Docker、HuggingFace、npm、PyPI、Dropbox、OneDrive、MEGA、测速网站。
 - 其余全部从出口机出：Google 搜索和账号、ChatGPT / Claude / Gemini 等 AI、Netflix、Disney+、TikTok、支付网站等。
 - 出口机断线时链式线路直接断开，IP 不会悄悄变成节点的；这时切到「直出」。
-- 出口机只接受节点 IP 的连接，其他来源一律静默丢弃。
+- 出口机公网入站全部关闭，只放行 SSH 和节点 IP；出口端口对其他来源静默丢弃，ping 也不回。加 `--no-lockdown` 则只管出口端口，其他端口保持原样。
 
 **Clash Mi 配置里**
 

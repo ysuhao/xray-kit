@@ -6,13 +6,15 @@
 #
 #   bash xray-kit.sh install [--name 名字] [--sni 伪装站] [--port Reality端口]   第一台：部署节点，生成 clash-mi.yaml
 #   bash xray-kit.sh exit --relay-ip 第一台IP [--name 名字] [--port 端口]        第二台：部署出口，输出 XKIT1: 开头的口令
+#                    [--no-lockdown]   默认关闭出口机公网上的所有入站端口，只放行 SSH 和第一台；加这个参数则只管出口端口
 #   bash xray-kit.sh chain <口令 | 口令文件 | ->                                回到第一台：接上出口，重新生成 clash-mi.yaml
 #   bash xray-kit.sh unchain                                                    第一台：拆掉链式，全部流量恢复本机直出
 #   bash xray-kit.sh test                                                       自检
 #   bash xray-kit.sh show                                                       再看一次结果和文件位置
 #
 # 只动 Xray 自己的东西：/usr/local/etc/xray、/root/xray-kit、xray-kit-*.service、nft 表 xray_kit_*。
-# 不改 SSH，不关防火墙，不碰其他服务；发现 443 被别的程序占用或已有别人的 Xray 配置就停下。
+# 不改 SSH，不碰其他服务；发现 443 被别的程序占用或已有别人的 Xray 配置就停下。
+# 出口机例外：默认把公网入站收紧到只剩 SSH 和第一台（nft 表 xray_kit_exit），--no-lockdown 关掉这一项。
 set -uo pipefail
 trap '' HUP PIPE   # SSH 断了也继续跑完（日志在 /root/xray-kit/run.log）
 
@@ -36,7 +38,7 @@ clean_name(){ printf '%s' "$1" | LC_ALL=C tr -cd 'A-Za-z0-9_.\200-\377-'; }
 
 # ---------------------------------------------------------------- arguments
 CMD=${1:-help}; [ $# -gt 0 ] && shift
-ARG_NAME="" ARG_SNI="" ARG_PORT="" ARG_RELAY="" FORCE=0 POS=""
+ARG_NAME="" ARG_SNI="" ARG_PORT="" ARG_RELAY="" ARG_LOCK="" FORCE=0 POS=""
 while [ $# -gt 0 ]; do
   case $1 in
     --name|--sni|--port|--relay-ip)
@@ -44,6 +46,8 @@ while [ $# -gt 0 ]; do
       case $1 in --name) ARG_NAME=$(clean_name "$2");; --sni) ARG_SNI=$2;; --port) ARG_PORT=$2;; --relay-ip) ARG_RELAY=$2;; esac
       shift 2;;
     --force) FORCE=1; shift;;
+    --no-lockdown) ARG_LOCK=0; shift;;
+    --lockdown) ARG_LOCK=1; shift;;
     *) POS=$1; shift;;
   esac
 done
@@ -488,25 +492,66 @@ render_exit(){
 EOF
 }
 
-exit_firewall(){ # only the relays may reach the exit port
-  local P r NFT set=""; P=$(get PORT); NFT=$(command -v nft)
+# ports sshd really listens on (also via ssh.socket), plus the port this session came in on
+ssh_ports(){
+  { ss -Hltnp 2>/dev/null | awk '/"(sshd|dropbear)"/{print $4}'
+    ss -Htnp state established 2>/dev/null | awk '/"(sshd|dropbear)"/{print $3}'
+    systemctl show -p Listen --value ssh.socket sshd.socket 2>/dev/null | tr ' ' '\n' | grep -E ':?[0-9]+$'
+    command -v sshd >/dev/null && sshd -T 2>/dev/null | awk '$1=="port"{print $2}'
+  } | sed -E 's/.*[]:]//; s/[^0-9].*//' | grep -E '^[0-9]+$' | awk '$1>0 && $1<65536' | sort -un | tr '\n' ' ' | sed 's/ $//'
+}
+# public listening ports that the lockdown will close (for the log only)
+closed_ports(){ local keep=" $1 "
+  ss -Hlntu 2>/dev/null | awk '{print $1, $5}' | grep -vE ' (127\.|\[::1\]|::1:|\[::ffff:127\.)' \
+    | sed -E 's/^(tcp|udp) .*:([0-9]+)$/\2\/\1/' | grep -E '^[0-9]+/(tcp|udp)$' | sort -u -t/ -k1,1n -k2 \
+    | while read -r x; do case $x in 68/udp|546/udp) continue;; esac; case "$keep" in *" ${x%/tcp} "*) [ "${x#*/}" = tcp ] && continue;; esac; printf '%s ' "$x"; done
+}
+
+exit_firewall(){ # lockdown (default): public NIC only lets in SSH, and the exit port from the relays. --no-lockdown: only guard the exit port
+  local P r NFT set="" wan="" body sp; P=$(get PORT); NFT=$(command -v nft)
   for r in ${RELAYS//,/ }; do set+="${set:+, }$r"; done
   if [ -n "$NFT" ] && nft list tables >/dev/null 2>&1; then
+    if [ "$(get LOCKDOWN)" = 1 ]; then
+      sp=$SSHP
+      wan=$({ ip -o route show default; ip -o -6 route show default; } 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | sort -u | sed 's/.*/"&"/' | paste -sd, | sed 's/,/, /g')
+      local cp; cp=$(closed_ports "$sp $P")
+      body="	chain input {
+		type filter hook input priority -5; policy accept;
+		iif \"lo\" accept
+		$([ -n "$wan" ] && echo "iifname { $wan } jump wan" || echo "jump wan")
+	}
+	chain wan {
+		ct state established,related accept
+		ct state invalid drop
+		icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, nd-router-solicit } accept
+		udp sport 67 udp dport 68 accept
+		udp sport 547 udp dport 546 accept
+		tcp dport { ${sp// /, } } accept
+		meta nfproto ipv4 ip saddr { $set } tcp dport $P accept
+		drop
+	}
+	chain forward {
+		type filter hook forward priority -5; policy accept;
+		$([ -n "$wan" ] && echo "iifname { $wan } ")ct state new ct status dnat drop
+	}"
+    else
+      body="	chain input {
+		type filter hook input priority -5; policy accept;
+		iif \"lo\" accept
+		meta nfproto ipv4 tcp dport $P ip saddr != { $set } drop
+		meta nfproto ipv6 tcp dport $P drop
+	}"
+    fi
     cat > /etc/xray-kit-exit.nft <<EOF
 table inet xray_kit_exit
 delete table inet xray_kit_exit
 table inet xray_kit_exit {
-	chain input {
-		type filter hook input priority -5; policy accept;
-		iif "lo" accept
-		meta nfproto ipv4 tcp dport $P ip saddr != { $set } drop
-		meta nfproto ipv6 tcp dport $P drop
-	}
+$body
 }
 EOF
     cat > /etc/systemd/system/xray-kit-exit-fw.service <<EOF
 [Unit]
-Description=xray-kit: only the relay servers may reach the exit port
+Description=xray-kit: exit server firewall (SSH + relay servers only)
 After=network-pre.target nftables.service
 Before=xray.service
 [Service]
@@ -518,9 +563,13 @@ ExecStop=$NFT delete table inet xray_kit_exit
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload; systemctl enable xray-kit-exit-fw.service >/dev/null 2>&1; systemctl restart xray-kit-exit-fw.service
-    nft list table inet xray_kit_exit >/dev/null 2>&1 && ok "端口 $P 只对 $set 开放（其他来源静默丢弃）" || warn "nft 白名单没生效，仅靠 Xray 自身按来源拦截"
+    if ! nft list table inet xray_kit_exit >/dev/null 2>&1; then warn "nft 防火墙没生效，仅靠 Xray 自身按来源拦截"
+    elif [ "$(get LOCKDOWN)" = 1 ]; then
+      ok "公网入站已关闭，只放行：SSH TCP ${sp// /、}；TCP $P 仅限 $set${wan:+（网卡 ${wan//\"/}）}"
+      [ -n "$cp" ] && ok "这些端口还在监听，但外网已经连不进来：$cp"
+    else ok "端口 $P 只对 $set 开放（其他来源静默丢弃）；其他端口未改动（--no-lockdown）"; fi
   else
-    warn "用不了 nftables，仅靠 Xray 自身按来源拦截"
+    warn "用不了 nftables，仅靠 Xray 自身按来源拦截，其他端口未改动"
   fi
   # an active ufw/firewalld/iptables policy must let the relays in
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -557,6 +606,10 @@ cmd_exit(){
   [ -n "$ARG_RELAY" ] && put RELAY_IPS "$ARG_RELAY"
   RELAYS=$(get RELAY_IPS); [ -n "$RELAYS" ] || die "缺少 --relay-ip 第一台服务器的IP"
   for r in ${RELAYS//,/ }; do is_ip "$r" || die "--relay-ip 里「$r」不是 IPv4 地址"; done
+  [ -n "$ARG_LOCK" ] && put LOCKDOWN "$ARG_LOCK"; [ -n "$(get LOCKDOWN)" ] || put LOCKDOWN 1
+  if [ "$(get LOCKDOWN)" = 1 ]; then
+    SSHP=$(ssh_ports); [ -n "$SSHP" ] || die "找不到 sshd 监听的端口，不敢关闭其他端口（会把自己锁在外面）。确认 SSH 正常后重跑，或加 --no-lockdown"
+  fi
   [ -n "$ARG_NAME" ] && put NAME "$ARG_NAME"; [ -n "$(get NAME)" ] || put NAME 出口
   local ip; ip=$(myip); is_ip "$ip" || die "查不到这台服务器的公网 IPv4"; put SERVER_IP "$ip"
   [ -n "$ARG_PORT" ] && put PORT "$ARG_PORT"; [ -n "$(get PORT)" ] || put PORT "$(shuf -i 40000-60000 -n1)"
@@ -584,6 +637,7 @@ cmd_exit(){
   echo
   echo "================================================================"
   echo " 出口机就绪：$(get NAME)  $(get SERVER_IP)  TCP $(get PORT)（只允许 $RELAYS 连接）"
+  [ "$(get LOCKDOWN)" = 1 ] && echo " 公网入站只放行 SSH（TCP ${SSHP// /、}）和上面这个端口，其他端口全部关闭"
   echo " 云服务商控制台的安全组要放行 TCP $(get PORT)（来源可以只填 $RELAYS）"
   echo " 口令已存到 $OUT/exit-token.txt，下一步在第一台上运行："
   echo "   bash xray-kit.sh chain <口令>"
@@ -644,7 +698,8 @@ cmd_test(){
 cmd_show(){
   case $(get ROLE) in
     node) summary_node;;
-    exit) echo "出口机 $(get NAME) $(get SERVER_IP) TCP $(get PORT)，允许 $(get RELAY_IPS)。口令：$OUT/exit-token.txt";;
+    exit) echo "出口机 $(get NAME) $(get SERVER_IP) TCP $(get PORT)，允许 $(get RELAY_IPS)。口令：$OUT/exit-token.txt"
+          if [ "$(get LOCKDOWN)" = 1 ]; then echo "公网入站只放行 SSH 和 $(get RELAY_IPS)；防火墙规则：nft list table inet xray_kit_exit"; fi;;
     *) die "这台机器还没部署";;
   esac
 }
