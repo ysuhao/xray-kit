@@ -17,7 +17,7 @@
 读 0-创建GCP服务器.md，照着做。
 ```
 
-AI 会装好 gcloud（中途请你在浏览器里登录一次 Google 账号）、开一台 Debian 12（默认用免费套餐的 e2-micro，地区俄勒冈）、放行端口，然后接着部署节点，最后交给你 Clash Mi 配置。
+AI 会装好 gcloud（中途请你在浏览器里登录一次 Google 账号），按免费套餐开一台 Debian 12（e2-micro、30 GB 标准磁盘、标准网络层，地区俄勒冈），放行端口，然后接着部署节点，装上每月 195 GiB 流量上限（到量停 Xray，下月自动恢复，不产生流量费），最后交给你 Clash Mi 配置。
 
 **第一步：部署节点（已有服务器）**
 
@@ -100,6 +100,7 @@ bash xray-kit.sh chain 'XKIT1:……'
 |---|---|
 | `xray-kit.sh` | 全部逻辑：装 Xray、生成密钥和证书、写配置、端口跳跃、BBR、防火墙放行、自检、生成 Clash Mi 配置 |
 | `0-创建GCP服务器.md` | 给 AI 的说明：用 gcloud 开 GCP 服务器、放行端口，再接着部署节点 |
+| `gcp-egress-cap.sh` | GCP 每月出站流量上限：每分钟统计，到 195 GiB 停 Xray（或 `--action poweroff` 关机），下月自动恢复 |
 | `1-部署节点.md` | 给 AI 的第一步操作说明 |
 | `2-链式出口.md` | 给 AI 的第二步操作说明 |
 
